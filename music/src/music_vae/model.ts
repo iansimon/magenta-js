@@ -354,6 +354,24 @@ abstract class BaseDecoder extends Decoder {
 }
 
 /**
+ * Decoder that samples from a Bernoulli distributon.
+ *
+ * Uses a probability threshold of 0.5 if no temperature is provided.
+ */
+class BooleanDecoder extends BaseDecoder {
+  sample(lstmOutput: tf.Tensor2D, temperature?: number): tf.Tensor2D {
+    const logits = lstmOutput;
+    return (temperature ?
+                tf.greaterEqual(
+                    tf.sigmoid(
+                        logits.div(tf.scalar(temperature)) as tf.Tensor2D),
+                    tf.randomUniform(logits.shape)) :
+                tf.greaterEqual(logits, 0))
+               .toFloat() as tf.Tensor2D;
+  }
+}
+
+/**
  * Decoder that samples from a Categorical distributon.
  *
  * Uses argmax if no temperature is provided.
@@ -494,11 +512,11 @@ class ConductorDecoder extends Decoder {
         }
         samples.push(tf.concat(currSamples, -1));
         initialInput = currSamples.map(
-          s => s.slice(
-                    [0, s.shape[1] - 1, 0],
-                    [batchSize, 1, s.shape[s.rank - 1]])
-                   .squeeze([1])
-                   .toFloat() as tf.Tensor2D);
+            s => s.slice(
+                      [0, s.shape[1] - 1, 0],
+                      [batchSize, 1, s.shape[s.rank - 1]])
+                     .squeeze([1])
+                     .toFloat() as tf.Tensor2D);
       }
       return tf.concat(samples, 1);
     });
