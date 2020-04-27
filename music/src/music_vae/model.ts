@@ -71,53 +71,33 @@ abstract class Encoder {
 }
 
 /**
- * A single-layer bidirectional LSTM encoder.
+ * A single-layer bidirectional LSTM module.
  */
-class BidirectionalLstmEncoder extends Encoder {
+class BidirectionalLstm {
   private lstmFwVars: LayerVars;
   private lstmBwVars: LayerVars;
-  private muVars: LayerVars;
-  readonly zDims: number;
 
   /**
-   * `BidirectionalLstmEncoder` contructor.
+   * `BidirectionalLstm` contructor.
    *
    * @param lstmFwVars The forward LSTM `LayerVars`.
    * @param lstmBwVars The backward LSTM `LayerVars`.
-   * @param muVars (Optional) The `LayerVars` for projecting from the final
-   * states of the bidirectional LSTM to the mean `mu` of the random variable,
-   * `z`. The final states are returned directly if not provided.
    */
-  constructor(
-      lstmFwVars: LayerVars, lstmBwVars: LayerVars, muVars?: LayerVars) {
-    super();
+  constructor(lstmFwVars: LayerVars, lstmBwVars: LayerVars) {
     this.lstmFwVars = lstmFwVars;
     this.lstmBwVars = lstmBwVars;
-    this.muVars = muVars;
-    this.zDims = muVars ? this.muVars.bias.shape[0] : null;
   }
 
   /**
-   * Encodes a batch of sequences.
-   * @param sequence The batch of sequences to be encoded.
-   * @param segmentLengths Unused for this encoder.
-   * @returns A batch of concatenated final LSTM states, or the `mu` if `muVars`
-   * is known.
+   * Processes a batch of sequences.
+   * @param sequence The batch of sequences to be processed.
+   * @returns A batch of forward and backward output LSTM states.
    */
-  encode(sequence: tf.Tensor3D, segmentLengths?: number[]) {
-    if (segmentLengths) {
-      throw new Error('Variable-length segments not supported in flat encoder');
-    }
-
+  process(sequence: tf.Tensor3D): [tf.Tensor2D[], tf.Tensor2D[]] {
     return tf.tidy(() => {
-      const fwState = this.singleDirection(sequence, true);
-      const bwState = this.singleDirection(sequence, false);
-      const finalState = tf.concat([fwState[1], bwState[1]], 1);
-      if (this.muVars) {
-        return dense(this.muVars, finalState);
-      } else {
-        return finalState;
-      }
+      const fwStates = this.singleDirection(sequence, true);
+      const bwStates = this.singleDirection(sequence, false);
+      return [fwStates, bwStates];
     });
   }
 
@@ -136,10 +116,62 @@ class BidirectionalLstmEncoder extends Encoder {
             forgetBias, lstmVars.kernel, lstmVars.bias, data, state[0],
             state[1]);
     const splitInputs = tf.split(inputs.toFloat(), length, 1);
+    const outputStates: tf.Tensor2D[] = [];
     for (const data of (fw ? splitInputs : splitInputs.reverse())) {
       state = lstm(data.squeeze([1]) as tf.Tensor2D, state);
+      outputStates.push(state[1]);
     }
-    return state;
+    return fw ? outputStates : outputStates.reverse();
+  }
+}
+
+/**
+ * A single-layer bidirectional LSTM encoder.
+ */
+class BidirectionalLstmEncoder extends Encoder {
+  private bidirectionalLstm: BidirectionalLstm;
+  private muVars: LayerVars;
+  readonly zDims: number;
+
+  /**
+   * `BidirectionalLstmEncoder` contructor.
+   *
+   * @param lstmFwVars The forward LSTM `LayerVars`.
+   * @param lstmBwVars The backward LSTM `LayerVars`.
+   * @param muVars (Optional) The `LayerVars` for projecting from the final
+   * states of the bidirectional LSTM to the mean `mu` of the random variable,
+   * `z`. The final states are returned directly if not provided.
+   */
+  constructor(
+      lstmFwVars: LayerVars, lstmBwVars: LayerVars, muVars?: LayerVars) {
+    super();
+    this.bidirectionalLstm = new BidirectionalLstm(lstmFwVars, lstmBwVars);
+    this.muVars = muVars;
+    this.zDims = muVars ? this.muVars.bias.shape[0] : null;
+  }
+
+  /**
+   * Encodes a batch of sequences.
+   * @param sequence The batch of sequences to be encoded.
+   * @param segmentLengths Unused for this encoder.
+   * @returns A batch of concatenated final LSTM states, or the `mu` if `muVars`
+   * is known.
+   */
+  encode(sequence: tf.Tensor3D, segmentLengths?: number[]) {
+    if (segmentLengths) {
+      throw new Error('Variable-length segments not supported in flat encoder');
+    }
+
+    return tf.tidy(() => {
+      const [fwStates, bwStates] = this.bidirectionalLstm.process(sequence);
+      const finalState =
+          tf.concat([fwStates[fwStates.length - 1], bwStates[0]], 1);
+      if (this.muVars) {
+        return dense(this.muVars, finalState);
+      } else {
+        return finalState;
+      }
+    });
   }
 }
 
@@ -262,6 +294,7 @@ abstract class BaseDecoder extends Decoder {
   protected outputProjectVars: LayerVars;
   readonly zDims: number;
   readonly outputDims: number;
+  readonly controlBidirectionalLstm?: BidirectionalLstm;
 
   /**
    * `BaseDecoder` contructor.
@@ -276,16 +309,25 @@ abstract class BaseDecoder extends Decoder {
    * @param nade (optional) A `Nade` to use for computing the output vectors at
    * each step. If not given, the final projection values are used as logits
    * for a categorical distribution.
+   * @param controlLstmFwVars (optional) The `LayerVars` for the forward
+   * direction of a bidirectional LSTM used to process the control tensors.
+   * @param controlLstmBwVars (optional) The `LayerVars` for the backward
+   * direction of a bidirectional LSTM used to process the control tensors.
    */
   constructor(
       lstmCellVars: LayerVars[], zToInitStateVars: LayerVars,
-      outputProjectVars: LayerVars, outputDims?: number) {
+      outputProjectVars: LayerVars, outputDims?: number,
+      controlLstmFwVars?: LayerVars, controlLstmBwVars?: LayerVars) {
     super();
     this.lstmCellVars = lstmCellVars;
     this.zToInitStateVars = zToInitStateVars;
     this.outputProjectVars = outputProjectVars;
     this.zDims = this.zToInitStateVars.kernel.shape[0];
     this.outputDims = outputDims || outputProjectVars.bias.shape[0];
+    if (controlLstmFwVars && controlLstmBwVars) {
+      this.controlBidirectionalLstm =
+          new BidirectionalLstm(controlLstmFwVars, controlLstmBwVars);
+    }
   }
 
   /**
@@ -334,6 +376,13 @@ abstract class BaseDecoder extends Decoder {
       let nextInput = initialInput ?
           initialInput :
           tf.zeros([batchSize, this.outputDims]) as tf.Tensor2D;
+      if (this.controlBidirectionalLstm) {
+        // Preprocess the controls with a bidirectional LSTM.
+        const [fwStates, bwStates] =
+            this.controlBidirectionalLstm.process(tf.expandDims(controls, 0));
+        controls = tf.squeeze(
+            tf.concat([tf.stack(fwStates, 1), tf.stack(bwStates, 1)], 2), [0]);
+      }
       const splitControls = controls ?
           tf.split(tf.tile(controls, [batchSize, 1]), controls.shape[0]) :
           undefined;
@@ -494,11 +543,11 @@ class ConductorDecoder extends Decoder {
         }
         samples.push(tf.concat(currSamples, -1));
         initialInput = currSamples.map(
-          s => s.slice(
-                    [0, s.shape[1] - 1, 0],
-                    [batchSize, 1, s.shape[s.rank - 1]])
-                   .squeeze([1])
-                   .toFloat() as tf.Tensor2D);
+            s => s.slice(
+                      [0, s.shape[1] - 1, 0],
+                      [batchSize, 1, s.shape[s.rank - 1]])
+                     .squeeze([1])
+                     .toFloat() as tf.Tensor2D);
       }
       return tf.concat(samples, 1);
     });
