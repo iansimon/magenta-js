@@ -26,6 +26,8 @@ import {writeMemory, writeNoteSeqs, writeTimer} from './common';
 mm.logging.verbosity = mm.logging.Level.DEBUG;
 
 const TRIO_INFILL_CKPT = `${CHECKPOINTS_DIR}/music_vae/trio_2bar_infill`;
+const TRIO_INFILL_KEYCHORDS_CKPT =
+    `${CHECKPOINTS_DIR}/music_vae/trio_2bar_infill_keychords/fb64`;
 const TRIO_RHYTHM_INFILL_DIR =
     `${CHECKPOINTS_DIR}/music_vae/trio_2bar_rhythm_infill`;
 const TRIO_RHYTHM_CKPT = `${TRIO_RHYTHM_INFILL_DIR}/rhythm`;
@@ -145,6 +147,124 @@ async function runTrio() {
   writeTimer('trio-similar-time', start);
   writeNoteSeqs(
       'trio-similar',
+      [similarMelSeqs[0], similarBassSeqs[0], similarDrumsSeqs[0]], true);
+
+  trioTensor.dispose();
+  melTensor.dispose();
+  bassTensor.dispose();
+  drumsTensor.dispose();
+
+  emptyMelTensor.dispose();
+  emptyBassTensor.dispose();
+  emptyDrumsTensor.dispose();
+
+  melInfillTensor.dispose();
+  bassInfillTensor.dispose();
+  drumsInfillTensor.dispose();
+
+  mvae.dispose();
+}
+
+async function runChordConditionedTrio() {
+  const mvae = new mm.MusicVAE(TRIO_INFILL_KEYCHORDS_CKPT);
+  await mvae.initialize();
+
+  writeNoteSeqs('trio-chords-inputs', [INITIAL_TRIO], true);
+
+  let start = performance.now();
+
+  const trioTensor = mvae.dataConverter.toTensor(INITIAL_TRIO);
+  const melTensor = trioTensor.slice([0, 0], [32, 90]);
+  const bassTensor = trioTensor.slice([0, 90], [32, 90]);
+  const drumsTensor = trioTensor.slice([0, 180], [32, 512]);
+
+  const emptyMelTensor = tf.zerosLike(melTensor);
+  const emptyBassTensor = tf.zerosLike(bassTensor);
+  const emptyDrumsTensor = tf.zerosLike(drumsTensor);
+
+  const melInfillTensor =
+      tf.concat2d([tf.ones([32, 1]), tf.zeros([32, 1]), tf.zeros([32, 1])], 1);
+  const bassInfillTensor =
+      tf.concat2d([tf.zeros([32, 1]), tf.ones([32, 1]), tf.zeros([32, 1])], 1);
+  const drumsInfillTensor =
+      tf.concat2d([tf.zeros([32, 1]), tf.zeros([32, 1]), tf.ones([32, 1])], 1);
+
+  const newMelSeqs = await mvae.sample(1, null, {
+    chordProgression: ['C', 'F', 'G', 'C'],
+    key: 0,
+    extraControls: {
+      melody: emptyMelTensor,
+      bass: bassTensor,
+      drums: drumsTensor,
+      infill: melInfillTensor,
+    }
+  });
+
+  const newBassSeqs = await mvae.sample(1, null, {
+    chordProgression: ['C', 'F', 'G', 'C'],
+    key: 0,
+    extraControls: {
+      melody: melTensor,
+      bass: emptyBassTensor,
+      drums: drumsTensor,
+      infill: bassInfillTensor,
+    }
+  });
+
+  const newDrumsSeqs = await mvae.sample(1, null, {
+    chordProgression: ['C', 'F', 'G', 'C'],
+    key: 0,
+    extraControls: {
+      melody: melTensor,
+      bass: bassTensor,
+      drums: emptyDrumsTensor,
+      infill: drumsInfillTensor,
+    }
+  });
+
+  writeTimer('trio-chords-sample-time', start);
+  writeNoteSeqs(
+      'trio-chords-samples', [newMelSeqs[0], newBassSeqs[0], newDrumsSeqs[0]],
+      true);
+
+  start = performance.now();
+
+  const similarMelSeqs = await mvae.similar(INITIAL_TRIO, 1, 0.8, null, {
+    chordProgression: ['C', 'F', 'G', 'C'],
+    key: 0,
+    extraControls: {
+      melody: emptyMelTensor,
+      bass: bassTensor,
+      drums: drumsTensor,
+      infill: melInfillTensor,
+    }
+  });
+
+  const similarBassSeqs = await mvae.similar(INITIAL_TRIO, 1, 0.8, null, {
+    chordProgression: ['C', 'F', 'G', 'C'],
+    key: 0,
+    extraControls: {
+      melody: melTensor,
+      bass: emptyBassTensor,
+      drums: drumsTensor,
+      infill: bassInfillTensor,
+    }
+  });
+
+  const similarDrumsSeqs = await mvae.similar(INITIAL_TRIO, 1, 0.8, null, {
+    chordProgression: ['C', 'F', 'G', 'C'],
+    key: 0,
+    extraControls: {
+      melody: melTensor,
+      bass: bassTensor,
+      drums: emptyDrumsTensor,
+      infill: drumsInfillTensor,
+    }
+  });
+
+  writeTimer('trio-chords-similar-time', start);
+  writeNoteSeqs(
+      'trio-chords-similar',
       [similarMelSeqs[0], similarBassSeqs[0], similarDrumsSeqs[0]], true);
 
   trioTensor.dispose();
@@ -387,6 +507,17 @@ async function generateTrioButton() {
   trioDiv.appendChild(trioButton);
 }
 
+async function generateChordConditionedTrioButton() {
+  const chordTrioButton = document.createElement('button');
+  chordTrioButton.textContent = 'Generate Chord-Conditioned Trio via Infilling';
+  chordTrioButton.addEventListener('click', () => {
+    runChordConditionedTrio();
+    chordTrioButton.disabled = true;
+  });
+  const chordTrioDiv = document.getElementById('generate-chords-trio');
+  chordTrioDiv.appendChild(chordTrioButton);
+}
+
 async function generateRhythmConditionedTrioButton() {
   const rhythmTrioButton = document.createElement('button');
   rhythmTrioButton.textContent =
@@ -404,6 +535,7 @@ try {
       .all([
         generateAllButton(),
         generateTrioButton(),
+        generateChordConditionedTrioButton(),
         generateRhythmConditionedTrioButton(),
       ])
       .then(() => writeMemory(tf.memory().numBytes));
